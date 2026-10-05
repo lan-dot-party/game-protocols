@@ -33,8 +33,9 @@
 12. [Reference implementation (Python, standard library only)](#12-reference-implementation-python-standard-library-only)
 13. [Differences to TrackMania Forever](#13-differences-to-trackmania-forever)
 14. [Verification status](#14-verification-status)
-15. [Ghidra index (addresses, class IDs)](#15-ghidra-index-addresses-class-ids)
-16. [Existing implementations](#16-existing-implementations)
+15. [Common pitfalls](#15-common-pitfalls)
+16. [Ghidra index (addresses, class IDs)](#16-ghidra-index-addresses-class-ids)
+17. [Existing implementations](#17-existing-implementations)
 
 ---
 
@@ -66,6 +67,8 @@ Server info: u8 0x07|0x09 | IP (4 bytes, reversed) | u16 port | str host login |
              | u32 n, n × wstr player name, n × i32 ladder ranking | wstr comment | u8 mode | u32 limit
              | u8 #maps | u32 m, m × (wstr name, u32 decoration index, u32 gold time, u32 copper price)
 str = wstr = u32 length + UTF-8 (wstr with BOM EF BB BF if non-ASCII)
+
+Map environment and mood: decoration index → table hard-coded per game (Section 8.6), e.g. Sunrise 13 = Island/Night
 ```
 
 All integers are **little-endian**.
@@ -596,9 +599,10 @@ fail the game tag check (`0x2D`).
 
 ## 12. Reference implementation (Python, standard library only)
 
-Tested live against the Sunrise eXtreme server (discovery via broadcast and query). The generated requests are
-byte-identical to the ones in [Section 10](#10-annotated-examples-real-capture).
-Usage: `python tms_query.py discover [broadcast address]` or `python tms_query.py <host> [port]`.
+Tested live against the Sunrise eXtreme server (discovery via broadcast and unicast, query, environment resolution).
+The generated requests are byte-identical to the ones in [Section 10](#10-annotated-examples-real-capture).
+Usage: `python tms_query.py discover [broadcast address]` or `python tms_query.py <host> [port]`
+(the latter first identifies the game with a unicast discovery query, which is needed for the environments).
 
 ```python
 """TrackMania Original/Sunrise/Nations ESWC server query - minimal reference implementation (stdlib only)."""
@@ -611,6 +615,13 @@ import struct
 KEY = bytes.fromhex("08c481303a1226abaf1d6ae4fb65fbc9")
 GAMES = {"TmOriginal": 4, "TmSunrise": 4, "TmNationsESWC": 5}        # game id -> ConnectionAdmin version
 GAME_MODES = {1: "TimeAttack", 3: "Rounds", 6: "Team", 7: "Laps", 8: "Stunts"}
+DECORATIONS = {                                                       # game id -> (environments, decorations)
+    "TmOriginal": (("Alpine", "Speed", "Rally"),
+                   ("32x32Sunset", "32x32Sunrise", "Simple", "30x30Sunrise", "30x30", "30x30Sunset",
+                    "20x60Sunrise", "20x60", "20x60Sunset", "10x150Sunrise", "10x150", "10x150Sunset")),
+    "TmSunrise": (("Bay", "Coast", "Island"), ("Sunrise", "Day", "Sunset", "Night")),
+    "TmNationsESWC": (("Stadium",), ("Day",)),
+}
 
 
 def checksum(message: bytes, pos: int) -> int:
@@ -629,6 +640,16 @@ def build_message(msg_type: int, payload: bytes) -> bytes:
 def connection_admin(version: int, subtype: int, *args: int) -> bytes:
     msg = build_message(3, struct.pack(f"<II{len(args)}I", version, subtype, *args))
     return struct.pack("<I", len(msg)) + msg          # TCP frame: u32 length
+
+
+def decoration(game_id: str, index: int):
+    """Decoration index -> (environment, mood); mood "" for the entry without decoration."""
+    if game_id not in DECORATIONS:
+        return None
+    environments, decorations = DECORATIONS[game_id]
+    table = sorted(((env, dec) for env in environments for dec in (*decorations, "")),
+                   key=lambda e: (e[0].lower(), (e[1] or "Unassigned").lower()))
+    return table[index - 2] if 2 <= index < len(table) + 2 else None
 
 
 def pack_str(text: str) -> bytes:
@@ -747,12 +768,15 @@ class Reader:
         return ".".join(map(str, reversed(self.take(4)))), self.u16()
 
 
-def parse_server_info(data: bytes) -> dict:
+def parse_server_info(data: bytes, game_id: str = None) -> dict:
+    """game_id (from discover()) is needed to resolve environments on Original/Sunrise servers."""
     r = Reader(data)
     tag = r.u8()
     if tag & 0xE0 != 0 or tag & 0x1F not in (0x07, 0x09):
         raise ValueError("not a TrackMania Original/Sunrise/Nations ESWC server")
-    info = {"game_tag": tag, "address": r.addr(), "host_login": r.str()}
+    if tag == 0x09:                                  # Original and Sunrise share tag 0x07
+        game_id = "TmNationsESWC"
+    info = {"game_tag": tag, "game_id": game_id, "address": r.addr(), "host_login": r.str()}
     login = r.str()                                  # "#SRV#" + "" / "p" / "s" / "f"
     if not login.startswith("#SRV#"):
         return info
@@ -775,10 +799,12 @@ def parse_server_info(data: bytes) -> dict:
         {"name": r.str(), "decoration_index": r.u32(), "gold_time": r.u32(), "copper_price": r.u32()}
         for _ in range(r.u32())
     ]
+    for challenge in info["challenges"]:
+        challenge["environment"], challenge["mood"] = decoration(game_id, challenge["decoration_index"]) or ("", "")
     return info
 
 
-def query_info(host: str, port: int = 2350, version: int = 4, timeout: float = 5.0) -> dict:
+def query_info(host: str, port: int = 2350, game_id: str = None, version: int = 4, timeout: float = 5.0) -> dict:
     request_id = secrets.randbelow(0x7FFFFFFF) + 1
     with socket.create_connection((host, port), timeout) as s:
         s.sendall(connection_admin(version, 8) + connection_admin(version, 7, request_id))
@@ -794,7 +820,7 @@ def query_info(host: str, port: int = 2350, version: int = 4, timeout: float = 5
             server_version, subtype = r.u32(), r.u32()
             if subtype == 1:                         # refused, e.g. "Please upgrade your application."
                 if server_version != version and server_version in (4, 5):
-                    return query_info(host, port, server_version, timeout)
+                    return query_info(host, port, game_id, server_version, timeout)
                 raise ValueError("query refused")
             if subtype != 6:
                 continue
@@ -802,7 +828,7 @@ def query_info(host: str, port: int = 2350, version: int = 4, timeout: float = 5
             if reply_id == 0xFFFFFFFF:
                 raise ValueError("server has no game info yet")
             if reply_id == request_id:
-                return parse_server_info(data)
+                return parse_server_info(data, game_id)
 
 
 def discover(address: str = "255.255.255.255", port: int = 2350, timeout: float = 2.0) -> list:
@@ -843,7 +869,9 @@ if __name__ == "__main__":
         print(json.dumps(discover(*sys.argv[2:3]), indent=2, ensure_ascii=False))
     else:
         port = int(sys.argv[2]) if len(sys.argv) > 2 else 2350
-        print(json.dumps(query_info(sys.argv[1], port), indent=2, ensure_ascii=False))
+        sessions = discover(sys.argv[1], port, 1.0)  # unicast discovery identifies the game
+        game_id = sessions[0]["game_id"] if sessions else None
+        print(json.dumps(query_info(sys.argv[1], port, game_id), indent=2, ensure_ascii=False))
 ```
 
 **Self-test:** the following expressions must evaluate to true.
@@ -851,11 +879,14 @@ if __name__ == "__main__":
 ```python
 connection_admin(4, 8).hex()         == "0e00000082038b9433740400000008000000"
 connection_admin(4, 7, 0x1234).hex() == "12000000820346e5b853040000000700000034120000"
+decoration("TmSunrise", 13)          == ("Island", "Night")
+decoration("TmOriginal", 15)         == ("Rally", "10x150")
+decoration("TmNationsESWC", 2)       == ("Stadium", "Day")
 ```
 
 The response from [Section 10](#10-annotated-examples-real-capture) must, after `decode_message(...)[1][16:]` and
-`parse_server_info`, yield the name `Sunrise LAN Server`, TimeAttack with 300000 ms and the map `NightFlight`
-(gold 39150, copper 1451).
+`parse_server_info(..., "TmSunrise")`, yield the name `Sunrise LAN Server`, TimeAttack with 300000 ms and the map
+`NightFlight` (gold 39150, copper 1451, Island/Night).
 
 ---
 
@@ -902,7 +933,32 @@ The response from [Section 10](#10-annotated-examples-real-capture) must, after 
 
 ---
 
-## 15. Ghidra index (addresses, class IDs)
+## 15. Common pitfalls
+
+1. **"The TrackMania Forever query also works for Sunrise."** Wrong. Key, checksum formula and version differ; a
+   Sunrise server silently drops a TmForever request (no refusal, no answer).
+2. **"The checksum is the sum of the four digest words."** Not here: `w[0] + w[1] + w[2] + key[0]`. A wrong checksum
+   is dropped without any reply, which looks exactly like "no server".
+3. **"Just send the highest version."** A version above the server's is ignored silently. Start with 4; only a
+   Nations ESWC server refuses it, and its refusal tells you to use 5.
+4. **"Game tag `0x07` means Sunrise."** Original and Sunrise share tag and version. Only the UDP discovery game id
+   (`TmOriginal` / `TmSunrise`) tells them apart, and you need it to resolve the environments.
+5. **"The first string is the server name."** It is the host login (computer name). The server name is the `wstr`
+   after the five counters.
+6. **"The layout is the same as TmForever's."** There is no pack mask after the server name, no environment list
+   at the end, and the map entries are `name, u32, u32, u32`. A TmForever parser derails right after the server name.
+7. **"The decoration index is a runtime id and cannot be mapped."** It points into a table hard-coded per game
+   (Section 8.6), so a fixed lookup works on every server of that game.
+8. **"The byte after `#SRV#` is the server type."** The suffix (`p`/`s`/`f`) is part of the string and encodes the
+   passwords. In the raw (compressed) stream, the byte after `#SRV#` is an LZO control byte.
+9. **"The response is plain text with fixed offsets."** It is LZO1X-compressed; decompress first.
+10. **"The discovery needs a special source port."** No, the server answers to the sender's address and port, so an
+    ephemeral port works (unlike e.g. FlatOut 2).
+11. **"The query returns all maps."** Only a window of up to 20 maps, starting with the current one.
+
+---
+
+## 16. Ghidra index (addresses, class IDs)
 
 Binary: `TrackManiaServer.exe` (TrackMania Sunrise eXtreme dedicated server), image base `0x00400000`.
 Functions created or named during the analysis: `CNetFormConnectionAdmin_Decode` (`0x004b2070`),
@@ -911,7 +967,7 @@ Functions created or named during the analysis: `CNetFormConnectionAdmin_Decode`
 (`0x0069a940`), `CTrackManiaNetworkServerInfo_ArchiveModeLimit` (`0x0069a8a0`), `XmlRpc_SetServerPassword`
 (`0x00626320`), `XmlRpc_SetServerPasswordForSpectator` (`0x00626470`).
 
-### 15.1 Game selection and network layer
+### 16.1 Game selection and network layer
 
 | Address | Function | Purpose |
 |---|---|---|
@@ -926,7 +982,7 @@ Functions created or named during the analysis: `CNetFormConnectionAdmin_Decode`
 | `0x004b86d0` | ConnectionAdmin handler | exact version check, subtypes 0/4/8/9, "Please upgrade" |
 | `0x004b81d0` | CNetServer UDP receive | QuerrySessions → game id check (`0x004b8430`) → EnumSessions |
 
-### 15.2 ConnectionAdmin and query
+### 16.2 ConnectionAdmin and query
 
 | Address | Function | Purpose |
 |---|---|---|
@@ -936,7 +992,7 @@ Functions created or named during the analysis: `CNetFormConnectionAdmin_Decode`
 | `0x004b1dd0` | Archive (vtable `0x007e64d0` + `0x3c`) | fields per subtype |
 | `0x0074d940` | Info reply | subtype 6, `0xFFFFFFFF` if no info |
 
-### 15.3 Server info
+### 16.3 Server info
 
 | Address | Function | Purpose |
 |---|---|---|
@@ -956,7 +1012,7 @@ Functions created or named during the analysis: `CNetFormConnectionAdmin_Decode`
 | `0x00657960` | GetChallengeList (copy loop) | environment `+0x38`, mood `+0x40`, gold `+0x58`, copper `+0x64` |
 | `0x005ddc30` | Client "FrameDialogJoin" | consumer of the challenge window |
 
-### 15.4 UDP discovery
+### 16.4 UDP discovery
 
 | Address | Function | Purpose |
 |---|---|---|
@@ -965,7 +1021,7 @@ Functions created or named during the analysis: `CNetFormConnectionAdmin_Decode`
 | `0x004aa410` | CNetServerInfo archive | 4 × `str`, 2 × `addr` |
 | `0x0074d430` | CGameNetwork constructor | registers "GameNet", game id and version |
 
-### 15.5 Class IDs
+### 16.5 Class IDs
 
 | Class | ID |
 |---|---|
@@ -981,9 +1037,10 @@ Functions created or named during the analysis: `CNetFormConnectionAdmin_Decode`
 
 ---
 
-## 16. Existing implementations
+## 17. Existing implementations
 
 | Project | File | Status |
 |---|---|---|
-| opengsq-python | `opengsq/protocols/trackmania_sunrise.py`, `opengsq/responses/trackmania_sunrise/server_info.py`, tests `tests/protocols/test_trackmania_sunrise.py` | Implemented based on this document (branch `feature/trackmania-sunrise-protocol`). `get_info()` (TCP, automatic version 4/5) and `get_session()` (UDP, game identification). |
-| Discord-Gameserver-Notifier | `src/discord_gameserver_notifier/discovery/protocols/trackmania_sunrise.py` | Game type `trackmania_sunrise`: UDP broadcast discovery for all three game ids, then TCP query; uses opengsq. |
+| opengsq-python | `opengsq/protocols/trackmania_sunrise.py`, `opengsq/responses/trackmania_sunrise/server_info.py`, tests `tests/protocols/test_trackmania_sunrise.py` | Implemented based on this document (branch `feature/trackmania-sunrise-protocol`). `get_info(game_id)` (TCP, version 4/5 chosen automatically, environments via `decoration()`) and `get_session()` (UDP, game identification). |
+| Discord-Gameserver-Notifier | `src/discord_gameserver_notifier/discovery/protocols/trackmania_sunrise.py` | Game type `trackmania_sunrise`: UDP broadcast discovery for all three game ids, then TCP query with the discovered game id; Discord shows mode, spectators, next maps, comment and the environment, e.g. "Island (Night)". |
+| game-protocols | `Trackmania-Sunrise.md` | This document. |
