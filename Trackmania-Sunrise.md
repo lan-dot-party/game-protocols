@@ -359,12 +359,55 @@ Verified live: TimeAttack with 300000 ms.
 - **Names are truncated to 15 characters** (UTF-16 units, before UTF-8 encoding).
 - **GoldTime** is the gold medal time in ms, **CopperPrice** the coppers display price
   (the client shows it as `"%d C"`, `0x005e3280`).
-- **DecorationIndex** is the challenge parameter `CollectionId2` (class `0x2400B000`, offset `+0x74`). The server
-  computes it as **2 + index of the challenge's decoration (environment + mood ident) in a decoration table** that is
-  built at runtime from the game data (`0x005e2af0` → `0x005eb450`), 0 if not found. It is engine internal and cannot
-  be mapped to an environment name reliably. Live values were 2–15 and stable per map
-  (e.g. `NightFlight` 13, `CarPark` 12, `HappyBay` 2). The environment itself is **not** part of the packet; the
-  full challenge list incl. environment and mood is only available via XML-RPC (`GetChallengeList`).
+- **DecorationIndex** encodes **environment and mood**, see 8.6. It is the challenge parameter `CollectionId2`
+  (class `0x2400B000`, offset `+0x74`); the game client shows it in its server browser.
+
+### 8.6 Decoration index → environment and mood
+
+The server computes the index as **2 + position of the challenge's decoration ident** (mood id + environment,
+challenge offsets `+0x40`/`+0x44`) **in a decoration table**, 0 if not found (`0x005e2af0` → `0x005eb450`).
+The table is **hard-coded per game** (`0x005ea740`, global `0x008e0880`) and therefore identical on every server
+of that game:
+
+1. For each environment, in this order, one entry **without** decoration (its id stays unassigned, `0xFFFFFFFF`,
+   whose string is `"Unassigned"`), followed by one entry per decoration `(decoration, environment, "Nadeo")`.
+2. The table is sorted with `qsort` (`0x005eb4e0`, comparator `0x0067b710`): first by environment name, then by
+   decoration name, both **case-insensitive** (`_stricmp`, `0x0040c4a0`). The entry without decoration sorts as
+   `"Unassigned"`, i.e. after all real decorations.
+
+| Game | Environments | Decorations |
+|---|---|---|
+| Sunrise | Bay, Coast, Island | Sunrise, Day, Sunset, Night |
+| Original | Alpine, Speed, Rally | 32x32Sunset, 32x32Sunrise, Simple, 30x30Sunrise, 30x30, 30x30Sunset, 20x60Sunrise, 20x60, 20x60Sunset, 10x150Sunrise, 10x150, 10x150Sunset |
+| Nations ESWC | Stadium | Day |
+
+Resulting table for **Sunrise** (index → environment / mood):
+
+| Index | Bay | Index | Coast | Index | Island |
+|---:|---|---:|---|---:|---|
+| 2 | Day | 7 | Day | 12 | Day |
+| 3 | Night | 8 | Night | 13 | Night |
+| 4 | Sunrise | 9 | Sunrise | 14 | Sunrise |
+| 5 | Sunset | 10 | Sunset | 15 | Sunset |
+| 6 | (none) | 11 | (none) | 16 | (none) |
+
+**Original:** 13 entries per environment in the order Alpine (2–14), Rally (15–27), Speed (28–40); within each:
+10x150, 10x150Sunrise, 10x150Sunset, 20x60, 20x60Sunrise, 20x60Sunset, 30x30, 30x30Sunrise, 30x30Sunset,
+32x32Sunrise, 32x32Sunset, Simple, (none). **Nations ESWC:** 2 = Stadium/Day, 3 = Stadium/(none).
+
+```python
+def decoration(environments, decorations, index):
+    table = sorted(((env, dec) for env in environments for dec in (*decorations, "")),
+                   key=lambda e: (e[0].lower(), (e[1] or "Unassigned").lower()))
+    return table[index - 2] if 2 <= index < len(table) + 2 else None
+```
+
+Original and Sunrise share game tag and version, so **the game must be known from the LAN discovery**
+([Section 9](#9-udp-lan-discovery)) to pick the right table.
+
+Verified live on the Sunrise server, the map names match the decoded moods and environments:
+`GoodMorning` 14 → Island/Sunrise, `Midnight` 13 → Island/Night, `NightFlight` 13 → Island/Night,
+`BeautifulDay` 12 → Island/Day, `Suburbs` 2 → Bay/Day, `HighStreet` 3 → Bay/Night, `ParadiseIsland` 15 → Island/Sunset.
 
 ---
 
@@ -827,7 +870,8 @@ The response from [Section 10](#10-annotated-examples-real-capture) must, after 
 | ConnectionAdmin version | 4 (Original, Sunrise), 5 (Nations ESWC), exact match | 7 |
 | Game tag | `0x07` / `0x09`, `(tag & 0xE0) == 0` | `0x2D`, `(tag & 0xE0) == 0x20` |
 | Pack mask | – | `str` after the server name |
-| Map entry | `wstr name, u32 decoration, u32 gold, u32 copper` | `wstr name, u32 gold, u16 copper, u8 env index` |
+| Map entry | `wstr name, u32 decoration index, u32 gold, u32 copper` | `wstr name, u32 gold, u16 copper, u8 env index` |
+| Environment of a map | via hard-coded decoration table (8.6) | via environment list in the packet |
 | Environment list | – | `u32 k` + lookback string ids |
 | Game modes | 1, 3, 6, 7, 8 | 1, 3, 6, 7, 8, 9 (Cup) |
 | Game identification | UDP discovery game id (`TmOriginal`, `TmSunrise`, `TmNationsESWC`) | pack mask |
@@ -848,6 +892,7 @@ The response from [Section 10](#10-annotated-examples-real-capture) must, after 
 | Counters, name, comment, mode, limit | ✅ | ✅ (no players connected) |
 | Window of 20 maps, map entry layout | ✅ | ✅ (54 → 20) |
 | GoldTime / CopperPrice semantics | ✅ | plausible values |
+| Decoration index → environment/mood (Sunrise table) | ✅ | ✅ (map names match) |
 | UDP discovery (unicast and broadcast), game id filter | ✅ | ✅ (`TmSunrise` answered, `TmOriginal`/`TmNationsESWC` not) |
 | `#SRV#p` / `s` / `f` | ✅ | – (only `#SRV#` observed) |
 | Player list with names and rankings, Unicode + BOM | ✅ | – |
@@ -906,6 +951,8 @@ Functions created or named during the analysis: `CNetFormConnectionAdmin_Decode`
 | `0x0069ae00` | Mode mapping | XML-RPC → internal ID |
 | `0x005e24b0` | GetParam of challenge info `0x2400B000` | `CollectionId2` = `+0x74` |
 | `0x005e2af0` / `0x005eb450` | Decoration index | 2 + table index of the decoration ident |
+| `0x005ea740` | Decoration table | hard-coded environments and decorations per game |
+| `0x005eb4e0` / `0x0067b710` | Sort | `qsort`, case-insensitive by environment, then decoration |
 | `0x00657960` | GetChallengeList (copy loop) | environment `+0x38`, mood `+0x40`, gold `+0x58`, copper `+0x64` |
 | `0x005ddc30` | Client "FrameDialogJoin" | consumer of the challenge window |
 
